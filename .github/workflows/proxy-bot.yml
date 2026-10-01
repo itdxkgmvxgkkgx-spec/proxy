@@ -1,0 +1,71 @@
+name: 🤖 Telegram Proxy Hunter Bot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    # 6 ساعت سقف هر ران است؛ قبل از تموم شدن، خودش ران جدید می‌زند
+    timeout-minutes: 355
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: 📂 Restore database from artifact (fallback اگر کامیت دیتا نشده بود)
+        uses: actions/download-artifact@v4
+        with:
+          name: proxy-bot-data
+          path: data/
+        continue-on-error: true
+
+      - name: 🚀 Run the bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          RUN_ID: ${{ github.run_id }}
+        run: python -m bot.main
+
+      - name: 💾 Save database (commit to repo)
+        if: always()
+        run: |
+          git config user.name "proxy-bot[bot]"
+          git config user.email "proxy-bot[bot]@users.noreply.github.com"
+          git add data/ || true
+          git diff --cached --quiet || git commit -m "💾 data snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push || true
+
+      - name: ☁️ Upload database artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-bot-data
+          path: data/
+          retention-days: 7
+          overwrite: true
+
+      - name: 🔁 Trigger next run (self-restart)
+        if: always()
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/proxy-bot.yml/dispatches" \
+            -d '{"ref":"main"}'

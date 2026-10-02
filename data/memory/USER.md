@@ -1,1 +1,3 @@
 User sometimes asks casual/playful questions (e.g. math) in Persian; respond in kind, briefly, then offer to help with real tasks. User is the owner (is_owner=True).
+§
+User is the owner of the bot (is_owner=True).

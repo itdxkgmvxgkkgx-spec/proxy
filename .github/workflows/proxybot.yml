@@ -1,0 +1,146 @@
+# ProxyBot — always-on Telegram MTProto proxy hunter.
+#
+# How "always on" works on GitHub Actions:
+#   * A job may run at most 6 hours. run.py stops itself at RUN_BUDGET_MIN (330 min),
+#     commits data/ and calls workflow_dispatch on this same file using GH_PAT.
+#   * If the job dies for any reason (crash, runner eviction, cancel), the `relay`
+#     job below re-dispatches it, and the hourly cron is a last-resort watchdog
+#     (the bot cancels duplicate pollers itself, so overlap is harmless).
+#   * data/ (SQLite + AI memory + skills) is committed every 30s by the bot and
+#     also uploaded as an artifact every run as a second copy.
+#
+# Required secrets:  BOT_TOKEN, ADMIN_ID, GH_PAT (repo + workflow scope)
+# Optional secrets:  TAVILY_API_KEY
+name: proxybot
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: why this run was started
+        default: manual
+      parent_run:
+        description: id of the run that chained this one
+        default: ""
+  schedule:
+    - cron: "17 * * * *"   # hourly watchdog
+  push:
+    branches: [main]
+    paths-ignore:
+      - "data/**"           # data commits carry [skip ci] anyway
+
+concurrency:
+  group: proxybot-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      ADMIN_ID: ${{ secrets.ADMIN_ID }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      RUN_BUDGET_MIN: "330"
+      WORKFLOW_FILE: proxybot.yml
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Skip watchdog if a run is already active
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          active=$(gh run list -R "$GITHUB_REPOSITORY" -w proxybot.yml --status in_progress --json databaseId -q 'length')
+          echo "active runs: $active"
+          if [ "$active" -gt 1 ]; then echo "SKIP=1" >> "$GITHUB_ENV"; fi
+
+      - uses: actions/checkout@v4
+        if: env.SKIP != '1'
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
+          ref: main
+
+      - name: Restore latest data artifact (fallback if git data is older)
+        if: env.SKIP != '1'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          mkdir -p data
+          id=$(gh run list -R "$GITHUB_REPOSITORY" -w proxybot.yml --status completed --json databaseId -q '.[0].databaseId' 2>/dev/null || true)
+          if [ -n "$id" ]; then
+            gh run download "$id" -R "$GITHUB_REPOSITORY" -n proxybot-data -D /tmp/artifact || true
+            if [ -f /tmp/artifact/proxybot.db ]; then
+              if [ ! -f data/proxybot.db ] || [ /tmp/artifact/proxybot.db -nt data/proxybot.db ]; then
+                echo "using artifact DB (newer than git copy)"; cp /tmp/artifact/proxybot.db data/proxybot.db
+              fi
+            fi
+          fi
+
+      - uses: actions/setup-python@v5
+        if: env.SKIP != '1'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        if: env.SKIP != '1'
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        if: env.SKIP != '1'
+        run: |
+          export RUN_STARTED_EPOCH=$(date +%s)
+          python run.py
+
+      - name: Final save of data/
+        if: always() && env.SKIP != '1'
+        continue-on-error: true
+        run: |
+          git config user.name "proxybot[bot]"
+          git config user.email "proxybot@users.noreply.github.com"
+          git add -A data/ || true
+          git commit -qm "data: final save [skip ci] run=${{ github.run_id }}" || true
+          git pull --rebase -X theirs origin main || true
+          git push origin HEAD:main || true
+
+      - name: Upload data artifact (second copy)
+        if: always() && env.SKIP != '1'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxybot-data
+          path: |
+            data/proxybot.db
+            data/memory
+            data/skills
+          retention-days: 14
+          overwrite: true
+
+  relay:
+    # Fires the next run whenever the bot job ends for any reason (success, crash, cancel, timeout).
+    needs: bot
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch next run
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          sleep 20
+          queued=$(gh run list -R "$GITHUB_REPOSITORY" -w proxybot.yml --status queued --json databaseId -q 'length')
+          active=$(gh run list -R "$GITHUB_REPOSITORY" -w proxybot.yml --status in_progress --json databaseId -q 'length')
+          echo "queued=$queued active=$active"
+          # 'active' includes this relay job's own run; anything beyond it means a bot is already alive.
+          if [ "$queued" -eq 0 ] && [ "$active" -le 1 ]; then
+            gh workflow run proxybot.yml -R "$GITHUB_REPOSITORY" --ref main -f reason=relay -f parent_run=${{ github.run_id }}
+            echo "dispatched"
+          else
+            echo "another run exists — not dispatching"
+          fi

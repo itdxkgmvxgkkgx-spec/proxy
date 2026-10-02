@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.venv/
+venv/
+*.log
+data/logs/*.log
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/tmp/
+.wrangler/
+node_modules/
+*.zip
